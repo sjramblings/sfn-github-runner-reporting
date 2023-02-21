@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  A Step Function to track GitHub Workflow_job event via EventBridge
+Parameters:
+  DdbTableName:
+    Type: String
+    Default: github-events
+  EventBusName:
+    Type: String
+    Default: github
+Resources:
+  DdbTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TableName: !Ref DdbTableName
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref EventBusName
+      EventPattern:
+        detail-type:
+          - workflow_job
+      State: ENABLED
+      Targets:
+        - Arn: !Ref StateMachinetoDDB
+          Id: 'StateMachinetoDDB'
+          RoleArn: !GetAtt TriggerStepFunctionRole.Arn
+  TriggerStepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: StepFunctionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: StepFunctionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Ref StateMachinetoDDB
+  StateMachinetoDDB:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Definition:
+        StartAt: CheckWorkflowJobId
+        States:
+          CheckWorkflowJobId:
+            Next: DoesItemExist
+            Parameters:
+              ExpressionAttributeValues:
+                ":id":
+                  S.$: States.Format('{}', $.detail.workflow_job.id)
+              KeyConditionExpression: id = :id
+              TableName: !Sub ${DdbTableName}
+            Resource: arn:aws:states:::aws-sdk:dynamodb:query
+            ResultPath: "$.CheckWorkflowJobId"
+            Type: Task
+          CreateItem:
+            Comment: Send the GitHub workflow_job event information for our DynamoDB item
+            End: true
+            Parameters:
+              Item:
+                completed_at:
+                conclusion.$: "$.detail.workflow_job.conclusion"
+                github_organization.$: "$.detail.organization.login"
+                github_repository.$: "$.detail.repository.name"
+                github_sender.$: "$.detail.sender.login"
+                id.$: States.Format('{}', $.detail.workflow_job.id)
+                runner_name.$: "$.detail.workflow_job.runner_name"
+                spot_price:
+                started_at.$: "$.time"
+                type.$: "$.detail-type"
+                workflow_name.$: "$.detail.workflow_job.name"
+                workflow_status.$: "$.detail.workflow_job.status"
+              TableName: !Sub ${DdbTableName}
+            Resource: arn:aws:states:::dynamodb:putItem
+            Type: Task
+          DoesItemExist:
+            Choices:
+            - Next: CreateItem
+              NumericEquals: 0
+              Variable: "$.CheckWorkflowJobId.Count"
+            Default: UpdateItemState
+            Type: Choice
+          GetSpotInfo:
+            Comment: Get the info of price for the SPOT instance for chargeback
+            Next: UpdateItemSpot
+            Parameters:
+              Filters:
+              - Name: instance-id
+                Values.$: States.StringSplit($.detail.workflow_job.runner_name, '')
+            Resource: arn:aws:states:::aws-sdk:ec2:describeSpotInstanceRequests
+            ResultPath: "$.GetSpotInfo"
+            Type: Task
+          Success:
+            Comment: If we have no runner in the message it has not been provisioned yet
+            Type: Succeed
+          UpdateItemSpot:
+            Parameters:
+              ExpressionAttributeValues:
+                ":runner_name":
+                  S.$: "$.detail.workflow_job.runner_name"
+                ":spot_price":
+                  S.$: States.ArrayGetItem($.GetSpotInfo.SpotInstanceRequests[:1].SpotPrice,
+                    0)
+              Key:
+                id:
+                  S.$: States.Format('{}', $.detail.workflow_job.id)
+              TableName: !Sub ${DdbTableName}
+              UpdateExpression: SET runner_name = :runner_name, spot_price = :spot_price
+            Resource: arn:aws:states:::dynamodb:updateItem
+            Type: Task
+            End: true
+          UpdateItemState:
+            Next: WorkflowComplete
+            Parameters:
+              ExpressionAttributeValues:
+                ":workflow_status":
+                  S.$: "$.detail.workflow_job.status"
+              Key:
+                id:
+                  S.$: States.Format('{}', $.detail.workflow_job.id)
+              TableName: !Sub ${DdbTableName}
+              UpdateExpression: SET workflow_status = :workflow_status
+            Resource: arn:aws:states:::dynamodb:updateItem
+            ResultPath: "$.UpdateItemState"
+            Type: Task
+          WorkflowComplete:
+            Choices:
+            - Next: GetSpotInfo
+              StringEquals: completed
+              Variable: "$.detail.action"
+            Comment: Catch for a null value for runner-name so our job will succeed
+            Default: UpdateItem
+            Type: Choice
+          UpdateItem:
+            Parameters:
+              ExpressionAttributeValues:
+                ":completed_at":
+                  S.$: "$.time"
+              Key:
+                id:
+                  S.$: States.Format('{}', $.detail.workflow_job.id)
+              TableName: !Sub ${DdbTableName}
+              UpdateExpression: SET completed_at = :completed_at
+            Resource: arn:aws:states:::dynamodb:updateItem
+            Type: Task
+            Next: Success
+      Role: !GetAtt StateMachineExecutionRole.Arn
+  StateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: DDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt DdbTable.Arn
+        - PolicyName: EC2SPOTPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSpotInstanceRequests
+                Resource: '*'
+Outputs:
+  StateMachinetoDDBArn:
+    Value: !Ref StateMachinetoDDB
+    Description: StateMachinetoDDB Arn
+  TableName:
+    Value: !Ref DdbTableName
+    Description: DynamoDb Table Name
